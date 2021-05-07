@@ -1,0 +1,254 @@
+---
+title: "DW_Project"
+author: "Krishna Chaitanya"
+date: "03/05/2021"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading Required Libraries
+
+```{r, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(rvest)
+library(httr)
+library(curl)
+library(jsonlite)
+library(tidytext)
+library(stringr)
+library(textdata)
+```
+
+## API Details
+
+```{r}
+NYTAPPID <- "7d67b6e9-b445-4005-8c6c-6bdd7bcfcd9a"
+NYTAPIKEY <- "cUEOxwB5XYeAODew4FGJzWSKUXzoOOXX"
+NYTAPISECRET <- "xqtgYvdwXOSLrBGp"
+```
+
+## Introduction
+The initial idea of this project was to do a sentiment analysis and comparison between NYT articles for a given search string. However, NYT API has the following limitations currently:
+1. It gives only 10 results at the maximum for any given search.
+2. Trying to iteratively get the total results would more often than not result in a "HTTP 429: Too many requests" error. 
+3. Introducing an idle time of 6 seconds between each call (as suggested on the NYT Developers page) did not help much.
+4. The API does not return full text of the article. 
+
+So, we had to make some changes to the project with certain assumptions in mind:
+1. We chose the abstract of each article for the purpose of sentiment analysis. The assumption here is that the abstract can holistically capture the sentiment of the actual article. 
+2. We had to limit the results to newest 100 for every month searched. The assumption clearly is that the latest 100 articles in a month would adequately capture the sentiment trend for the whole month. 
+3. We had to introduce sleep/idle time of 20 seconds between each API call. Even though this didn't completely resolve the issue, it definitely helped to a good extent. However, the downside is that each sentiment analysis plot takes upwards of 8 minutes to be generated. 
+
+## Defining a Sleep Function to use between calls to avoid 429: Too Many Requests Error
+
+```{r}
+sleepfunction <- function(x)
+{
+  p1 <- proc.time()
+  Sys.sleep(x)
+  proc.time() - p1 # The cpu usage should be negligible
+}
+```
+The NYT API returns only a maximum of 10 results for each request - irrespective of the actual number of matching results for the search key. Trying to retrieve the results iteratively (through a regular for loop, for instance) more often than not leads to a "HTTP 429: Too Many Requests". So, we define this sleep function to set some sleep time between each consecutive API call. Currently, we have set 20 seconds of sleep time between each consecutive API call and 60 seconds of sleep time before resuming search for the second month's data. These settings have reduced the occurrence of the error by a good margin, even though it still occurs sporadically from time to time. 
+
+
+## Defining a function to get the number of days in a given month
+
+```{r}
+numberOfDays <- function(date) {
+  m <- format(date, format="%m")
+  
+  while (format(date, format="%m") == m) {
+    date <- date + 1
+  }
+  
+  return(as.integer(format(date - 1, format="%d")))
+}
+```
+The API call string requires the beginning and end dates for the search. Since each month has different number of days, it makes sense to define a function that would provide us the number of days in a month given any date in that month. The output from this function can be parsed and combined with other inputs to generate the required the API call url in each iteration. 
+
+
+## Break the API call string into required parts so that the appropriate portions can be modified and joined together for each call
+
+```{r}
+urlpart1 <- "https://api.nytimes.com/svc/search/v2/articlesearch.json?q="
+urlpart2 <- "&begin_date="
+begindate <- "20200101"
+urlpart3 <- "&end_date="
+enddate <- "20201231"
+urlpart4 <- "&sort=newest&page="
+pagenumber <- 1
+urlpart5 <- "&api-key=cUEOxwB5XYeAODew4FGJzWSKUXzoOOXX"
+```
+
+As can be seen, the parts 'begindate', 'enddate', and 'pagenumber' are the portions in the URL that need to be adjusted for each search. The page number needs to be updated after each iteration - and this will be based on the number of hits generated for any given search string. 
+
+
+## Define a function to generate the API call url for a given set of search parameters: searchstring, month and year
+
+```{r, warning=FALSE, message=FALSE}
+urlgenerator <- function(searchstring, year, month){
+  
+  if (month <10) {
+    month <- paste(0,month,sep = "")
+  }
+  date1 <- paste(year, month, "01", sep = "")
+  firstdayofmonth <- as.Date(paste(year, month, 01, sep = "-"))
+  numberofdaysinmonth <- numberOfDays(firstdayofmonth)
+  date2 <- paste(year, month, numberofdaysinmonth, sep = "")
+  
+  generatedURL <- paste(urlpart1, searchstring, urlpart2, date1, urlpart3, date2, urlpart4, pagenumber, urlpart5, sep = "")
+  
+  return(generatedURL)
+  
+}
+```
+This function takes the search string, the year and month related to the search and uses the previously written functions to generate the API call url. 
+
+
+## Define a function to retrieve the newest 10 articles for the particular month, year, and search string
+
+```{r, warning=FALSE, message=FALSE}
+condensedarticledf <- function(inputurl){
+  
+  firstdf <- inputurl %>% jsonlite::fromJSON() %>% as.data.frame(, stringsAsFactors = FALSE)
+  condenseddf <- cbind(firstdf$response.docs.abstract, firstdf$response.docs.pub_date, firstdf$response.meta.hits)
+  colnames(condenseddf) <- c("Abstract", "Date", "MetaHits")
+  condenseddf <- as.data.frame(condenseddf, stringsAsFactors = FALSE)
+  condenseddf$MetaHits <- as.numeric(condenseddf$MetaHits)
+  return(condenseddf)
+}
+```
+
+The next logical step was to build a function that utilizes everything we have written so far to retrieve relevant information for the latest 10 articles. This function does the same. It generates the API url using the previously written function, sends out the request, converts the returned json object into a data frame with the columns relevant to us: Abstract of each article, date of each article, and the number of articles relevant to this search. 
+
+Note that the value of the third column "MetaHits" will be same throughout the dataframe. Since the API returns the metahits in the json in this way, we just retained it in our dataframe in order to understand how many pages we need to request to get the required number of articles. 
+
+
+## Define a function to get the number of actual pages possible from the search 
+
+```{r, warning=FALSE, message=FALSE}
+numberofpages <- function(hits){
+  
+  
+  pagesnumber <- as.integer(hits/10)
+  
+  return(pagesnumber)
+}
+
+pagenumber <- 0
+```
+This function gives us an idea of how many pages of information to request without risking the possibility of generating an incorrect url and getting an empty json object (which could lead to us getting an error instead of the output)
+
+
+## Define a function to iteratively query for search results for up to 10 pages and put them all together
+
+```{r, warning=FALSE, message=FALSE}
+allarticles_condenseddf <- function(searchstring, year, month){
+  inputurl <- urlgenerator(searchstring, year, month)
+  outputdataframe <- condensedarticledf(inputurl)
+  sleepfunction(20)
+  numberofpages <- as.integer(as.numeric(outputdataframe$MetaHits[1])/10)
+  pagenumber <- as.numeric(pagenumber) + 1
+  if (numberofpages > 10) {
+    numberofpages <- 10
+  }
+  while (pagenumber < numberofpages){
+    sleepfunction(20)
+    inputurl <- urlgenerator(searchstring, year, month)
+    tempdataframe <- condensedarticledf(inputurl)
+    outputdataframe <- rbind(outputdataframe, tempdataframe)
+    pagenumber = as.numeric(pagenumber) + 1
+    
+  }
+  monthcolumn <- rep(month, nrow(outputdataframe))
+  outputdataframe$month <- monthcolumn
+  
+  pagenumber <- 0
+  return(outputdataframe)
+}
+```
+
+This function takes everything we have worked on so far, and generates a dataframe that contains upto 100 latest articles related to the search string for the concerned month. As mentioned previously, we had to limit our search to 100 articles to reduce the risk of getting the HTTP 429 error. 
+
+
+## Define function to choose only the relevant columns from the dataframe and put them together in a tibble
+
+```{r, warning=FALSE, message=FALSE}
+articles_condensedtibble <- function(inputdf){
+  outputtibble <- as_tibble(inputdf)
+  outputtibble <- outputtibble %>% mutate(article_number = row_number()) %>% relocate(article_number) %>% select(-MetaHits) %>% select(-Date)
+  return(outputtibble)
+}
+```
+Since we already captured the value of metahits to generate the pagenumbers and subsequent urls, we can remove it now. 
+And we convert our dataframe to a tibble for easier manipulation down the line. 
+
+
+## Define function to use bing lexicon and add a sentiment value column for each word 
+
+```{r, warning=FALSE, message=FALSE}
+articles_sentiment_tibble <- function(inputtibble1){
+  monthnumber = inputtibble1$month[1]
+  output_sentiment_tibble <- inputtibble1 %>% unnest_tokens(word, Abstract) %>% anti_join(stop_words) %>% inner_join(get_sentiments("bing")) %>% count(article_number, sentiment) %>% pivot_wider(names_from = "sentiment", values_from = "n") %>% replace_na(list(negative = 0, positive = 0)) %>% mutate(sentiment = positive - negative)
+  
+  output_sentiment_tibble <- output_sentiment_tibble %>% mutate(month = monthnumber)
+  
+  return(output_sentiment_tibble)
+  
+}
+```
+This function takes the tibble created in the previous step, tokenizes the text of the abstracts, removes stop words, and uses bing lexicon to generate sentiment values. It then takes a summation, then the difference between positive sentiment and negative sentiment to provide an overall sentiment value for each article with respect to the search string utilized. 
+
+
+## Define a function that will use all the previous functions to create a tibble with pertinent columns for the given two months 
+
+```{r, warning=FALSE, message=FALSE}
+finalsentimenttibble <- function(searchstring, year1, month1, year2, month2){
+  
+  tdf1 <- allarticles_condenseddf(searchstring, year1, month1)
+  tibble1 <- articles_condensedtibble(tdf1)
+  sentiment_tibble_1 <- articles_sentiment_tibble(tibble1)
+
+  sleepfunction(60)
+  
+  tdf2 <- allarticles_condenseddf(searchstring, year2, month2)
+  tibble2 <- articles_condensedtibble(tdf2)
+  sentiment_tibble_2 <- articles_sentiment_tibble(tibble2)
+  
+  output_sentiment_tibble <- rbind(sentiment_tibble_1, sentiment_tibble_2)
+  return(output_sentiment_tibble)
+}
+```
+
+We now define this function that basically does the same job but for two months of data, i.e., it calls the previous function twice - one time for each month given by the user, then generates a tibble with the sentiment value for each of the articles in both months. This output tibble is in a convenient format to plot the sentiments for each month in order to get an idea of how the sentiment for the particular search word has changed in NYT articles for the given two months. 
+
+
+## Define function that takes the tibble and plots the sentiment trend for the search string for the two given months 
+
+```{r, warning=FALSE, message=FALSE}
+sentiment_comparison <- function(searchstring, year1, month1, year2, month2){
+  finaloutputtibble <- finalsentimenttibble(searchstring, year1, month1, year2, month2)
+  ggplot(finaloutputtibble, aes(article_number, sentiment, fill = month)) + geom_point() + facet_wrap(~month, ncol = 2, scales = "free_x") + theme(legend.position = "none") + geom_smooth()
+  
+}
+```
+This function takes the previously generated tibble and provides the required output. 
+
+
+## Let's look at how the sentiment has changed for the word 'covid' between January 2021 and April 2021
+
+```{r, warning=FALSE, message=FALSE}
+sentiment_comparison("covid", 2021, 01, 2021, 04)
+```
+
+
+Here's an example word search. The idea behind taking this word is to see how the sentiment for the word "covid" has changed from early in 2021 to April 2021 when vaccination efforts have been increased. 
+
+It's noteworthy to see how the sentiment has improved for the better between these two periods.
+
